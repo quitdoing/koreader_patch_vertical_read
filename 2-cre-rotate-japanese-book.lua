@@ -409,3 +409,38 @@ ReaderHighlight.showHighlightDialog = function(self, index)
     UIManager:show(self.edit_highlight_dialog)
     return true
 end
+
+-- Wrap onHoldPan to fix hold_pos adjustment after corner scroll in vertical reading mode.
+-- Instead of reimplementing the whole function, we let the original handle everything
+-- (corner detection, text selection, etc.) and only fix up hold_pos.x afterwards.
+local ReaderHighlight_orig_onHoldPan = ReaderHighlight.onHoldPan
+ReaderHighlight.onHoldPan = function(self, arg, ges)
+    if not self.ui.doc_settings:isTrue("vertical_reading_hack") then
+        return ReaderHighlight_orig_onHoldPan(self, arg, ges)
+    end
+
+    -- In rotated mode, the original onHoldPan adjusts hold_pos.y after corner scroll,
+    -- but that adjustment is a no-op because getScreenPositionFromXPointer returns
+    -- the non-scroll-affected value first. We need to adjust hold_pos.x instead.
+    local saved_hold_x = self.hold_pos and self.hold_pos.x
+    local orig_screen_x
+    if self.hold_pos and self.selected_text_start_xpointer then
+        -- Second return value from the rotated getScreenPositionFromXPointer
+        -- tracks the screen X position which changes with scroll
+        local _, x = self.ui.document:getScreenPositionFromXPointer(self.selected_text_start_xpointer)
+        orig_screen_x = x
+    end
+    local pos_before = self.ui.document:getCurrentPos()
+
+    -- Call original onHoldPan — all corner detection and text selection logic runs as-is
+    local result = ReaderHighlight_orig_onHoldPan(self, arg, ges)
+
+    -- If a corner scroll happened (document position changed), fix hold_pos.x
+    local pos_after = self.ui.document:getCurrentPos()
+    if pos_before ~= pos_after and self.hold_pos and orig_screen_x then
+        local _, new_screen_x = self.ui.document:getScreenPositionFromXPointer(self.selected_text_start_xpointer)
+        self.hold_pos.x = saved_hold_x - orig_screen_x + new_screen_x
+    end
+
+    return result
+end
