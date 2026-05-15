@@ -260,6 +260,26 @@ ReaderRolling.onPreRenderDocument = function(self)
             end
         elseif drawer == "invert" then
             bb:invertRect(x, y, w, h)
+        elseif drawer == "squiggly" then
+            -- Rotated 90°: a *vertical* sine wave running down the glyph
+            -- column, anchored where the rotated underscore sits.
+            if not color then
+                color = Blitbuffer.COLOR_GRAY_4
+            end
+            local thick = Size.line.thick
+            local amp = math.max(2, math.floor(thick + 0.5)) -- wave amplitude (px)
+            local wlen = amp * 6                              -- wavelength (px)
+            local base_x = x + w - 12                          -- same anchor as rotated underscore
+            local tau = 2 * math.pi
+            local is8 = Blitbuffer.isColor8(color)
+            for j = 0, h - 1 do
+                local px = base_x + math.floor(amp * math.sin(tau * j / wlen) + 0.5)
+                if is8 then
+                    bb:paintRect(px, y + j, thick, 1, color)
+                else
+                    bb:paintRectRGB32(px, y + j, thick, 1, color)
+                end
+            end
         end
     end
 
