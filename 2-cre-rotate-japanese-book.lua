@@ -6,6 +6,9 @@ local ReaderView = require("apps/reader/modules/readerview")
 local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
 local util = require("util")
+local RenderImage = require("ui/renderimage")
+local ffi = require("ffi")
+local C = ffi.C
 
 local Dispatcher = require("dispatcher")  -- luacheck:ignore
 local InfoMessage = require("ui/widget/infomessage")
@@ -15,6 +18,143 @@ local _ = require("gettext")
 if G_reader_settings == nil then
     G_reader_settings = require("luasettings"):open(
         DataStorage:getDataDir().."/settings.reader.lua")
+end
+
+-- Cache: xpointer (top of page) -> boolean (true if page contains any text)
+local page_has_text_cache = {}
+
+local function currentPageHasText(doc)
+    local xp0 = doc:getXPointer()
+    if not xp0 then return true end
+    if page_has_text_cache[xp0] ~= nil then
+        return page_has_text_cache[xp0]
+    end
+    local current_page = doc:getCurrentPage()
+    local xp1 = doc:getPageXPointer(current_page + 1) or doc:getPageXPointer(current_page)
+    local has_text = true
+    if xp1 then
+        local text = doc:getTextFromXPointers(xp0, xp1, false)
+        has_text = text ~= nil and text:match("%S") ~= nil
+    end
+    page_has_text_cache[xp0] = has_text
+    return has_text
+end
+
+-- Sample pixels to decide if the image has non-trivial content (not all white/black)
+local function imageHasContent(image)
+    local iw, ih = image:getWidth(), image:getHeight()
+    if not iw or not ih or iw <= 0 or ih <= 0 then return false end
+    local samples = {
+        {x = iw * 0.25, y = ih * 0.25},
+        {x = iw * 0.5,  y = ih * 0.5},
+        {x = iw * 0.75, y = ih * 0.75},
+    }
+    for _, s in ipairs(samples) do
+        local ok, px = pcall(function() return image:getPixel(math.floor(s.x), math.floor(s.y)) end)
+        if ok and px then
+            local r, g, b = px.r or 255, px.g or 255, px.b or 255
+            if not (r > 240 and g > 240 and b > 240) and not (r < 15 and g < 15 and b < 15) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Cover image via EPUB manifest (not position-based). Works reliably for page 1.
+local function getCoverImage(doc)
+    local ok, image = pcall(function() return doc:getCoverPageImage() end)
+    if ok and image then return image end
+    return nil
+end
+
+-- Extract image src paths from an HTML fragment
+local function extractImagePaths(html)
+    local paths = {}
+    if not html then return paths end
+    for src in html:gmatch('<img[^>]-src%s*=%s*["\']([^"\']+)["\']') do
+        paths[#paths + 1] = src
+    end
+    for href in html:gmatch('<image[^>]-href%s*=%s*["\']([^"\']+)["\']') do
+        paths[#paths + 1] = href
+    end
+    for href in html:gmatch('xlink:href%s*=%s*["\']([^"\']+%.[jpnggifwebpJPNGIFWEBP]+)["\']') do
+        paths[#paths + 1] = href
+    end
+    return paths
+end
+
+-- Try to load an image file from the EPUB by internal path.
+-- Tries the path as-given, then with/without leading slash, and common epub path prefixes.
+local function loadImageFromBook(doc, path)
+    local candidates = { path }
+    if path:sub(1, 1) == "/" then
+        candidates[#candidates + 1] = path:sub(2)
+    else
+        candidates[#candidates + 1] = "/" .. path
+    end
+    -- Strip ../ segments
+    local stripped = path:gsub("%.%./", "")
+    if stripped ~= path then
+        candidates[#candidates + 1] = stripped
+        candidates[#candidates + 1] = "/" .. stripped
+    end
+    for _, cand in ipairs(candidates) do
+        local ok, data = pcall(function() return doc:getDocumentFileContent(cand) end)
+        if ok and data and #data > 100 then
+            local image = RenderImage:renderImageData(data, #data, false)
+            if image then
+                return image, cand
+            end
+        end
+    end
+    return nil
+end
+
+-- Extract the current page's primary image by parsing HTML for <img src> and
+-- loading the file directly from the EPUB. Works when position-based extraction
+-- returns stubs.
+local function extractPageImageFromHTML(doc)
+    local xp0 = doc:getXPointer()
+    if not xp0 then return nil end
+    local current_page = doc:getCurrentPage()
+    local xp1 = doc:getPageXPointer(current_page + 1) or doc:getPageXPointer(current_page)
+    if not xp1 then return nil end
+    local ok, html = pcall(function() return doc:getHTMLFromXPointers(xp0, xp1, 0, false) end)
+    if not ok or not html then return nil end
+    local paths = extractImagePaths(html)
+    local best_image = nil
+    local best_size = 0
+    for _, p in ipairs(paths) do
+        local image = loadImageFromBook(doc, p)
+        if image then
+            local iw, ih = image:getWidth(), image:getHeight()
+            if imageHasContent(image) and iw * ih > best_size then
+                if best_image then best_image:free() end
+                best_image = image
+                best_size = iw * ih
+            else
+                image:free()
+            end
+        end
+    end
+    return best_image
+end
+
+-- Minimal probe: only try the page center; bails immediately on failure.
+-- Avoids the 49-probe loop that segfaulted the JPEG decoder.
+local function extractPageImage(doc, screen_w, screen_h)
+    local cw, ch = screen_h, screen_w
+    local data, size = doc._document:getImageDataFromPosition(cw / 2, ch / 2, false)
+    if not data or not size then return nil end
+    local image = RenderImage:renderImageData(data, size, false)
+    C.free(data)
+    if not image then return nil end
+    if not imageHasContent(image) then
+        image:free()
+        return nil
+    end
+    return image
 end
 
 -- Add menu item to toggle the vertical reading hack
@@ -133,6 +273,8 @@ ReaderRolling.onPreRenderDocument = function(self)
     document.drawCurrentView = function(self, target, x, y, rect, pos)
         self.orig_rect_w = rect.w -- added
         self.orig_rect_h = rect.h -- added
+        local screen_w, screen_h = rect.w, rect.h -- remember un-swapped screen dims
+
         rect = rect:copy() -- added
         rect.w, rect.h = rect.h, rect.w -- added
         if self.buffer and (self.buffer.w ~= rect.w or self.buffer.h ~= rect.h) then
@@ -144,6 +286,52 @@ ReaderRolling.onPreRenderDocument = function(self)
         end
         self._drawn_images_count, self._drawn_images_surface_ratio =
             self._document:drawCurrentPage(self.buffer, self.render_color, Screen.night_mode and self._nightmode_images, self._smooth_scaling, Screen.sw_dithering)
+
+        -- Detect image-only pages. _drawn_images_surface_ratio is side-effect-free
+        -- and cheap; text check only runs as a confirmation.
+        local image_ratio = self._drawn_images_surface_ratio or 0
+        local drawn_images = self._drawn_images_count or 0
+        local is_image_only = drawn_images > 0 and image_ratio > 0.5 and not currentPageHasText(self)
+
+        if is_image_only then
+            local image
+            if self:getCurrentPage() == 1 then
+                image = getCoverImage(self)
+            end
+            if not image then
+                image = extractPageImageFromHTML(self)
+            end
+            if not image then
+                image = extractPageImage(self, screen_w, screen_h)
+            end
+            if image then
+                local iw, ih = image:getWidth(), image:getHeight()
+                if iw and ih and iw > 0 and ih > 0 then
+                    local scale = math.min(screen_w / iw, screen_h / ih)
+                    local draw_w = math.max(1, math.floor(iw * scale))
+                    local draw_h = math.max(1, math.floor(ih * scale))
+                    local dx = x + math.floor((screen_w - draw_w) / 2)
+                    local dy = y + math.floor((screen_h - draw_h) / 2)
+                    target:paintRect(x, y, screen_w, screen_h, Blitbuffer.COLOR_WHITE)
+                    local to_blit = image
+                    if iw ~= draw_w or ih ~= draw_h then
+                        local scaled = image:scale(draw_w, draw_h)
+                        if scaled then to_blit = scaled end
+                    end
+                    -- Compose onto an opaque white intermediate so alpha doesn't kill the blit
+                    local composed = Blitbuffer.new(draw_w, draw_h, Screen.bb:getType())
+                    composed:fill(Blitbuffer.COLOR_WHITE)
+                    composed:pmulalphablitFrom(to_blit, 0, 0, 0, 0, draw_w, draw_h)
+                    target:blitFrom(composed, dx, dy, 0, 0, draw_w, draw_h)
+                    composed:free()
+                    if to_blit ~= image then to_blit:free() end
+                    image:free()
+                    return
+                end
+                image:free()
+            end
+        end
+
         self.buffer:rotate(-90) -- added
         target:blitFrom(self.buffer, x, y, 0, 0, rect.h, rect.w) -- h and w inverted here
         self.buffer:rotate(90) -- added
