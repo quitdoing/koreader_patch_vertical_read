@@ -10,14 +10,14 @@ local RenderImage = require("ui/renderimage")
 local ffi = require("ffi")
 local C = ffi.C
 
-local Dispatcher = require("dispatcher")  -- luacheck:ignore
+local Dispatcher = require("dispatcher") -- luacheck:ignore
 local InfoMessage = require("ui/widget/infomessage")
 
 local DataStorage = require("datastorage")
 local _ = require("gettext")
 if G_reader_settings == nil then
     G_reader_settings = require("luasettings"):open(
-        DataStorage:getDataDir().."/settings.reader.lua")
+        DataStorage:getDataDir() .. "/settings.reader.lua")
 end
 
 -- Cache: xpointer (top of page) -> boolean (true if page contains any text)
@@ -40,21 +40,38 @@ local function currentPageHasText(doc)
     return has_text
 end
 
--- Sample pixels to decide if the image has non-trivial content (not all white/black)
+-- Sample pixels to decide if the image has non-trivial content (not single color)
 local function imageHasContent(image)
     local iw, ih = image:getWidth(), image:getHeight()
     if not iw or not ih or iw <= 0 or ih <= 0 then return false end
     local samples = {
-        {x = iw * 0.25, y = ih * 0.25},
-        {x = iw * 0.5,  y = ih * 0.5},
-        {x = iw * 0.75, y = ih * 0.75},
+        { x = iw * 0.25, y = ih * 0.25 },
+        { x = iw * 0.5,  y = ih * 0.5 },
+        { x = iw * 0.75, y = ih * 0.75 },
     }
+    local first = nil
     for _, s in ipairs(samples) do
         local ok, px = pcall(function() return image:getPixel(math.floor(s.x), math.floor(s.y)) end)
         if ok and px then
-            local r, g, b = px.r or 255, px.g or 255, px.b or 255
-            if not (r > 240 and g > 240 and b > 240) and not (r < 15 and g < 15 and b < 15) then
-                return true
+            local px_type = tostring(ffi.typeof(px))
+            if px_type:find("Color4U") or px_type:find("Color4L") or px_type:find("Color8") or px_type:find("Color8A") then
+                if not first then
+                    first = px.a
+                elseif px.a ~= first then
+                    return true
+                end
+            elseif px_type:find("ColorRGB16") then
+                if not first then
+                    first = px.v
+                elseif px.v ~= first then
+                    return true
+                end
+            else
+                if not first then
+                    first = px
+                elseif px.r ~= first.r or px.g ~= first.g or px.b ~= first.b then
+                    return true
+                end
             end
         end
     end
@@ -122,6 +139,8 @@ local function extractPageImageFromHTML(doc)
     if not xp1 then return nil end
     local ok, html = pcall(function() return doc:getHTMLFromXPointers(xp0, xp1, 0, false) end)
     if not ok or not html then return nil end
+    -- extract only the current page
+    html = html:match("<DocFragment.-</DocFragment>")
     local paths = extractImagePaths(html)
     local best_image = nil
     local best_size = 0
@@ -161,7 +180,7 @@ end
 ReaderRolling_orig_addToMainMenu = ReaderRolling.addToMainMenu
 ReaderRolling.addToMainMenu = function(self, menu_items)
     ReaderRolling_orig_addToMainMenu(self, menu_items)
-    menu_items.toggle_vertical_hack =  {
+    menu_items.toggle_vertical_hack = {
         sorting_hint = "typeset",
         text = "Toggle vertical reading",
         checked_func = function()
@@ -174,7 +193,7 @@ ReaderRolling.addToMainMenu = function(self, menu_items)
             end)
         end,
     }
-    menu_items.toggle_dictionary_lookup =  {
+    menu_items.toggle_dictionary_lookup = {
         sorting_hint = "typeset",
         text = _("Dictionary on single word selection"),
         checked_func = function()
@@ -195,7 +214,7 @@ ReaderRolling.onPreRenderDocument = function(self)
     isVerticalHackEnabled = self.ui.doc_settings:isTrue("vertical_reading_hack")
     if not isVerticalHackEnabled then
         return
-    end    
+    end
 
     -- Inverse reading order (not sure this is for the best, as ToC items are RTL,
     -- but BookMap and PageBrowser may look as expected)
@@ -230,7 +249,8 @@ ReaderRolling.onPreRenderDocument = function(self)
                     -- NOTE: If we do *not* invert the color here, it *will* get inverted by the blitter given that the target bb is inverted.
                     --       While not particularly pretty, this (roughly) matches with hardware nightmode, *and* how MuPDF renders highlights...
                     --       But it's *really* not pretty (https://github.com/koreader/koreader/pull/11044#issuecomment-1902886069), so we'll fix it ;p.
-                    local c = Blitbuffer.ColorRGB32(color.r, color.g, color.b, 0xFF * self.highlight.lighten_factor):invert()
+                    local c = Blitbuffer.ColorRGB32(color.r, color.g, color.b, 0xFF * self.highlight.lighten_factor)
+                        :invert()
                     bb:blendRectRGB32(x, y, w, h, c)
                 else
                     bb:multiplyRectRGB(x, y, w, h, color)
@@ -254,7 +274,7 @@ ReaderRolling.onPreRenderDocument = function(self)
                 color = Blitbuffer.COLOR_GRAY_4
             end
             if Blitbuffer.isColor8(color) then
-                bb:paintRect(x + w - 12 , y, Size.line.thick, h, color)
+                bb:paintRect(x + w - 12, y, Size.line.thick, h, color)
             else
                 bb:paintRectRGB32(x + w - 12, y, Size.line.thick, h, color)
             end
@@ -268,8 +288,8 @@ ReaderRolling.onPreRenderDocument = function(self)
             end
             local thick = Size.line.thick
             local amp = math.max(2, math.floor(thick + 0.5)) -- wave amplitude (px)
-            local wlen = amp * 6                              -- wavelength (px)
-            local base_x = x + w - 12                          -- same anchor as rotated underscore
+            local wlen = amp * 6                             -- wavelength (px)
+            local base_x = x + w - 12                        -- same anchor as rotated underscore
             local tau = 2 * math.pi
             local is8 = Blitbuffer.isColor8(color)
             for j = 0, h - 1 do
@@ -291,12 +311,12 @@ ReaderRolling.onPreRenderDocument = function(self)
 
     -- Cut and pasted from the original, with a few lines added here and there
     document.drawCurrentView = function(self, target, x, y, rect, pos)
-        self.orig_rect_w = rect.w -- added
-        self.orig_rect_h = rect.h -- added
+        self.orig_rect_w = rect.w                 -- added
+        self.orig_rect_h = rect.h                 -- added
         local screen_w, screen_h = rect.w, rect.h -- remember un-swapped screen dims
 
-        rect = rect:copy() -- added
-        rect.w, rect.h = rect.h, rect.w -- added
+        rect = rect:copy()                        -- added
+        rect.w, rect.h = rect.h, rect.w           -- added
         if self.buffer and (self.buffer.w ~= rect.w or self.buffer.h ~= rect.h) then
             self.buffer:free()
             self.buffer = nil
@@ -305,13 +325,15 @@ ReaderRolling.onPreRenderDocument = function(self)
             self.buffer = Blitbuffer.new(rect.w, rect.h, self.render_color and Blitbuffer.TYPE_BBRGB32 or nil)
         end
         self._drawn_images_count, self._drawn_images_surface_ratio =
-            self._document:drawCurrentPage(self.buffer, self.render_color, Screen.night_mode and self._nightmode_images, self._smooth_scaling, Screen.sw_dithering)
+            self._document:drawCurrentPage(self.buffer, self.render_color, Screen.night_mode and self._nightmode_images,
+                self._smooth_scaling, Screen.sw_dithering)
 
         -- Detect image-only pages. _drawn_images_surface_ratio is side-effect-free
         -- and cheap; text check only runs as a confirmation.
         local image_ratio = self._drawn_images_surface_ratio or 0
         local drawn_images = self._drawn_images_count or 0
-        local is_image_only = drawn_images > 0 and image_ratio > 0.5 and not currentPageHasText(self)
+        -- 0.5 is too high a standard to filter out many image only pages, so I lower it to 0.3
+        local is_image_only = drawn_images > 0 and image_ratio > 0.3 and not currentPageHasText(self)
 
         if is_image_only then
             local image
@@ -352,9 +374,9 @@ ReaderRolling.onPreRenderDocument = function(self)
             end
         end
 
-        self.buffer:rotate(-90) -- added
+        self.buffer:rotate(-90)                                  -- added
         target:blitFrom(self.buffer, x, y, 0, 0, rect.h, rect.w) -- h and w inverted here
-        self.buffer:rotate(90) -- added
+        self.buffer:rotate(90)                                   -- added
     end
 
     local orig_getWordFromPosition = document.getWordFromPosition
@@ -427,7 +449,7 @@ ReaderRolling.onPreRenderDocument = function(self)
             if not link._already_rotated then
                 link._already_rotated = true
                 if link.segments and #link.segments > 0 then
-                    for i=1, #link.segments do
+                    for i = 1, #link.segments do
                         local segment = link.segments[i]
                         segment.x0, segment.y0 = self.orig_rect_w - segment.y0, segment.x0
                         segment.x1, segment.y1 = self.orig_rect_w - segment.y1, segment.x1
@@ -448,7 +470,8 @@ ReaderRolling.onToggleVerticalRead = function(self)
     end)
 end
 
-Dispatcher:registerAction("toggle_vertical_read", {category="none", event="ToggleVerticalRead", title="Toggle Vertical Read", rolling=true})
+Dispatcher:registerAction("toggle_vertical_read",
+    { category = "none", event = "ToggleVerticalRead", title = "Toggle Vertical Read", rolling = true })
 
 function onToggleVerticalRead()
     ReaderRolling:onToggleVerticalRead()
@@ -457,34 +480,35 @@ end
 ReaderRolling.onToggleDictionaryLookup = function(self)
     G_reader_settings:flipNilOrFalse("highlight_action_on_single_word")
     local isOn = G_reader_settings:nilOrFalse("highlight_action_on_single_word")
-    local loading = InfoMessage:new{
-      text = "Dictionary Lookup: "..(isOn and _("Enabled") or _("disabled")),
-      timeout = 2
+    local loading = InfoMessage:new {
+        text = "Dictionary Lookup: " .. (isOn and _("Enabled") or _("disabled")),
+        timeout = 2
     }
     UIManager:show(loading)
 end
 
-Dispatcher:registerAction("toggle_dictionary_lookup", {category="none", event="ToggleDictionaryLookup", title="Toggle Dictionary Lookup on Word", rolling=true})
+Dispatcher:registerAction("toggle_dictionary_lookup",
+    { category = "none", event = "ToggleDictionaryLookup", title = "Toggle Dictionary Lookup on Word", rolling = true })
 
 function onToggleDictionaryLookup()
     ReaderRolling:onToggleDictionaryLookup()
 end
 
-
 -- add an action to toggle highlight action or show action menu
-Dispatcher:registerAction("toggle_highlight_or_menu", {category="none", event="ToggleHighlightOrMenu", title="Select to Highlight or Menu", rolling=true})
+Dispatcher:registerAction("toggle_highlight_or_menu",
+    { category = "none", event = "ToggleHighlightOrMenu", title = "Select to Highlight or Menu", rolling = true })
 
 ReaderRolling.onToggleHighlightOrMenu = function(self)
     local current_highlight_action = G_reader_settings:readSetting("default_highlight_action", "ask")
     if current_highlight_action == "highlight" then
         G_reader_settings:saveSetting("default_highlight_action", "ask")
-        UIManager:show(InfoMessage:new{
+        UIManager:show(InfoMessage:new {
             text = _("Action menu is enabled.\nSelect text to show actions."),
             timeout = 2
         })
     else
         G_reader_settings:saveSetting("default_highlight_action", "highlight")
-        UIManager:show(InfoMessage:new{
+        UIManager:show(InfoMessage:new {
             text = _("Highlight is enabled.\nSelect text to highlight."),
             timeout = 2
         })
@@ -505,7 +529,7 @@ ReaderHighlight.showHighlightDialog = function(self, index)
     if not isVerticalHackEnabled then
         ReaderHighlight_orig_showHighlightDialog(self, index)
         return
-    end    
+    end
 
     local item = self.ui.annotation.annotations[index]
     local enabled = not item.text_edited
@@ -611,7 +635,7 @@ ReaderHighlight.showHighlightDialog = function(self, index)
         }
     }
 
-    self.edit_highlight_dialog = ButtonDialog:new{
+    self.edit_highlight_dialog = ButtonDialog:new {
         buttons = buttons,
     }
     UIManager:show(self.edit_highlight_dialog)
